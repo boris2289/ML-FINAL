@@ -1,0 +1,120 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ──────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ege_predictions
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init_tables.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ege_predictions"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── MLflow Tracking Server ──────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.0
+    command: mlflow server --host 0.0.0.0 --port 5001 --backend-store-uri sqlite:///mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+    ports:
+      - "5001:5001"
+    volumes:
+      - mlflow_data:/mlflow
+
+  # ── Training (one-shot) ─────────────────────
+  training:
+    build: .
+    command: >
+      python -m app.training.train_with_mlflow
+        --tracking-uri http://mlflow:5001
+        --register-model
+    environment:
+      PYTHONPATH: /app
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ege_predictions
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    profiles:
+      - train
+
+  # ── FastAPI ─────────────────────────────────
+  api:
+    build: .
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONPATH: /app
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ege_predictions
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Streamlit Frontend ──────────────────────
+  frontend:
+    build: .
+    command: streamlit run app/frontend/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    environment:
+      PYTHONPATH: /app
+      API_BASE_URL: http://api:8000
+      ROLLING_CSV_PATH: /app/data/prepared_rolling_dataset.csv
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ege_predictions
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Batch Scheduler ─────────────────────────
+  batch-scheduler:
+    build: .
+    command: python -m app.batch.scheduler
+    environment:
+      PYTHONPATH: /app
+      BATCH_INTERVAL_SECONDS: "300"
+      BATCH_LIMIT: "100"
+      BATCH_MODEL_VERSION: docker-catboost-v1
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - batch
+
+volumes:
+  postgres_data:
+  mlflow_data:
