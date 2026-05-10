@@ -1,38 +1,18 @@
-version: "3.9"
-
-# ══════════════════════════════════════════════════════════════
-#  Все сервисы читают параметры из .env.
-#  Новый эксперимент = правите .env → docker compose up.
-# ══════════════════════════════════════════════════════════════
-
 services:
-  # ── PostgreSQL ──────────────────────────────
-  postgres:
-    image: postgres:16-alpine
-    env_file: .env
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-ege_predictions}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./sql/init_tables.sql:/docker-entrypoint-initdb.d/init.sql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ege_predictions}"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   # ── MLflow Tracking Server ──────────────────
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.16.0
-    command: mlflow server --host 0.0.0.0 --port 5001 --backend-store-uri sqlite:///mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5001
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
     ports:
-      - "5001:5001"
+      - "${MLFLOW_PORT:-5001}:5001"
     volumes:
       - mlflow_data:/mlflow
+    restart: unless-stopped
 
   # ── Data Preparation (one-shot) ─────────────
   prepare-data:
@@ -41,34 +21,42 @@ services:
     env_file: .env
     environment:
       PYTHONPATH: /app
-      POSTGRES_HOST: postgres
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       MLFLOW_TRACKING_URI: http://mlflow:5001
     volumes:
       - ./data:/app/data
       - ./artifacts:/app/artifacts
     depends_on:
-      postgres:
-        condition: service_healthy
+      - mlflow
     profiles:
       - prepare
 
   # ── Training (one-shot) ─────────────────────
   training:
     build: .
-    command: python -m app.training.train_with_mlflow --register-model
+    command: >
+      python -m app.training.train_with_mlflow
+      --tracking-uri http://mlflow:5001
+      --register-model
     env_file: .env
     environment:
       PYTHONPATH: /app
-      POSTGRES_HOST: postgres
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       MLFLOW_TRACKING_URI: http://mlflow:5001
+      GIT_PYTHON_REFRESH: quiet
     volumes:
       - ./data:/app/data
       - ./artifacts:/app/artifacts
     depends_on:
-      postgres:
-        condition: service_healthy
-      mlflow:
-        condition: service_started
+      - mlflow
     profiles:
       - train
 
@@ -79,25 +67,37 @@ services:
     env_file: .env
     environment:
       PYTHONPATH: /app
-      POSTGRES_HOST: postgres
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      MLFLOW_TRACKING_URI: http://mlflow:5001
     ports:
       - "${API_PORT:-8000}:${API_PORT:-8000}"
     volumes:
       - ./artifacts:/app/artifacts
     depends_on:
-      postgres:
-        condition: service_healthy
+      - mlflow
     restart: unless-stopped
 
   # ── Streamlit Frontend ──────────────────────
   frontend:
     build: .
-    command: streamlit run app/frontend/streamlit_app.py --server.port ${STREAMLIT_PORT:-8501} --server.address 0.0.0.0
+    command: >
+      streamlit run app/frontend/streamlit_app.py
+      --server.port ${STREAMLIT_PORT:-8501}
+      --server.address 0.0.0.0
     env_file: .env
     environment:
       PYTHONPATH: /app
-      POSTGRES_HOST: postgres
       API_BASE_URL: http://api:${API_PORT:-8000}
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      ROLLING_CSV_PATH: /app/data/prepared_rolling_dataset.csv
     ports:
       - "${STREAMLIT_PORT:-8501}:${STREAMLIT_PORT:-8501}"
     volumes:
@@ -114,16 +114,19 @@ services:
     env_file: .env
     environment:
       PYTHONPATH: /app
-      POSTGRES_HOST: postgres
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      BATCH_INTERVAL_SECONDS: ${BATCH_INTERVAL_SECONDS:-300}
+      BATCH_LIMIT: ${BATCH_LIMIT:-100}
+      BATCH_MODEL_VERSION: ${BATCH_MODEL_VERSION:-docker-catboost-v1}
     volumes:
       - ./artifacts:/app/artifacts
-    depends_on:
-      postgres:
-        condition: service_healthy
     restart: unless-stopped
     profiles:
       - batch
 
 volumes:
-  postgres_data:
   mlflow_data:

@@ -25,6 +25,39 @@ API_BASE_URL = cfg.api_base_url
 DEFAULT_SEED_LIMIT = cfg.default_seed_limit
 
 
+
+
+def make_json_serializable(value):
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.isoformat()
+
+    if isinstance(value, np.datetime64):
+        if pd.isna(value):
+            return None
+        return pd.Timestamp(value).isoformat()
+
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, np.integer):
+        return int(value)
+
+    if isinstance(value, np.floating):
+        return float(value)
+
+    if isinstance(value, np.bool_):
+        return bool(value)
+
+    return value
+
+
+def row_to_payload(row: pd.Series) -> dict:
+    return {
+        key: make_json_serializable(value)
+        for key, value in row.to_dict().items()
+    }
+
+
 def call_prediction_api(features: dict) -> dict:
     response = requests.post(
         f"{API_BASE_URL}/predict",
@@ -129,7 +162,7 @@ with db_browse_tab:
 
             if st.button("Предсказать выбранную строку"):
                 try:
-                    features = row.to_dict()
+                    features = row_to_payload(row)
                     result = call_prediction_api(features)
                     st.success(f"Прогноз: {result['predicted_ege_score']}")
                     st.write(f"Истинный балл: {true_ege}")

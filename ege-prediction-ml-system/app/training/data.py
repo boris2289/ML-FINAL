@@ -54,12 +54,29 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
     ]
     df = df[[c for c in keep_cols if c in df.columns]].copy()
 
+    # Числовые поля, которые могут приехать из CSV как строки
+    for col in [
+        "course_student_ege_result",
+        "student_target",
+        "student_class",
+        "course_student_active",
+        "homework_done_respectful",
+        "homework_done_mark",
+        "homework_done_mark_probe",
+        "test_part",
+        "test_done_mark",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     # Таргет: балл ЕГЭ в допустимом диапазоне
+    df = df[df["course_student_ege_result"].notna()]
     df = df[df["course_student_ege_result"].between(0, cfg.ege_max_score)]
     df = df[df["course_student_ege_result"] >= cfg.ege_min_score]
     df["course_student_ege_result"] = df["course_student_ege_result"].astype(float)
 
     # Ожидаемый балл студента 0–100
+    df = df[df["student_target"].notna()]
     df = df[(df["student_target"] >= 0.0) & (df["student_target"] <= 100.0)]
     df["student_target"] = df["student_target"].astype(str)
 
@@ -93,9 +110,9 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype(str)
     for col in numerical_columns:
         if col in df.columns:
-            df[col] = df[col].astype(float)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     if "lesson_date" in df.columns:
-        df["lesson_date"] = pd.to_datetime(df["lesson_date"])
+        df["lesson_date"] = pd.to_datetime(df["lesson_date"], errors="coerce")
 
     return df
 
