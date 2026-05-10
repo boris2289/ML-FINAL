@@ -1,12 +1,16 @@
-from pathlib import Path
+"""
+Пути проекта — делегируют всё в центральный Settings.
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT_DIR / "data"
-ARTIFACTS_DIR = ROOT_DIR / "artifacts"
+Модуль сохранён для обратной совместимости.
+"""
+from app.core.config import get_settings
 
-RAW_CSV_PATH = DATA_DIR / "2025_07_24_el_school.csv"
-CLEANED_CSV_PATH = DATA_DIR / "cleaned_dataset.csv"
-ROLLING_CSV_PATH = DATA_DIR / "prepared_rolling_dataset.csv"
+_cfg = get_settings()
 
-MODEL_PATH = ARTIFACTS_DIR / "catboost_model.cbm"
-METRICS_PATH = ARTIFACTS_DIR / "metrics.json"
+ROOT_DIR = _cfg.root_dir
+DATA_DIR = _cfg.data_path
+ARTIFACTS_DIR = _cfg.artifacts_path
+
+RAW_CSV_PATH = _cfg.raw_csv_path
+MODEL_PATH = _cfg.model_path
+METRICS_PATH = _cfg.metrics_path

@@ -1,20 +1,26 @@
 version: "3.9"
 
+# ══════════════════════════════════════════════════════════════
+#  Все сервисы читают параметры из .env.
+#  Новый эксперимент = правите .env → docker compose up.
+# ══════════════════════════════════════════════════════════════
+
 services:
   # ── PostgreSQL ──────────────────────────────
   postgres:
     image: postgres:16-alpine
+    env_file: .env
     environment:
-      POSTGRES_DB: ege_predictions
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-ege_predictions}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
-      - "5433:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./sql/init_tables.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ege_predictions"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ege_predictions}"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -28,20 +34,33 @@ services:
     volumes:
       - mlflow_data:/mlflow
 
+  # ── Data Preparation (one-shot) ─────────────
+  prepare-data:
+    build: .
+    command: python scripts/seed_postgres_from_csv.py --prepare
+    env_file: .env
+    environment:
+      PYTHONPATH: /app
+      POSTGRES_HOST: postgres
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - prepare
+
   # ── Training (one-shot) ─────────────────────
   training:
     build: .
-    command: >
-      python -m app.training.train_with_mlflow
-        --tracking-uri http://mlflow:5001
-        --register-model
+    command: python -m app.training.train_with_mlflow --register-model
+    env_file: .env
     environment:
       PYTHONPATH: /app
-      MLFLOW_TRACKING_URI: http://mlflow:5001
       POSTGRES_HOST: postgres
-      POSTGRES_DB: ege_predictions
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      MLFLOW_TRACKING_URI: http://mlflow:5001
     volumes:
       - ./data:/app/data
       - ./artifacts:/app/artifacts
@@ -56,15 +75,13 @@ services:
   # ── FastAPI ─────────────────────────────────
   api:
     build: .
-    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port ${API_PORT:-8000}
+    env_file: .env
     environment:
       PYTHONPATH: /app
       POSTGRES_HOST: postgres
-      POSTGRES_DB: ege_predictions
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+    ports:
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
     volumes:
       - ./artifacts:/app/artifacts
     depends_on:
@@ -75,17 +92,14 @@ services:
   # ── Streamlit Frontend ──────────────────────
   frontend:
     build: .
-    command: streamlit run app/frontend/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
-    ports:
-      - "8501:8501"
+    command: streamlit run app/frontend/streamlit_app.py --server.port ${STREAMLIT_PORT:-8501} --server.address 0.0.0.0
+    env_file: .env
     environment:
       PYTHONPATH: /app
-      API_BASE_URL: http://api:8000
-      ROLLING_CSV_PATH: /app/data/prepared_rolling_dataset.csv
       POSTGRES_HOST: postgres
-      POSTGRES_DB: ege_predictions
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      API_BASE_URL: http://api:${API_PORT:-8000}
+    ports:
+      - "${STREAMLIT_PORT:-8501}:${STREAMLIT_PORT:-8501}"
     volumes:
       - ./data:/app/data
       - ./artifacts:/app/artifacts
@@ -97,15 +111,10 @@ services:
   batch-scheduler:
     build: .
     command: python -m app.batch.scheduler
+    env_file: .env
     environment:
       PYTHONPATH: /app
-      BATCH_INTERVAL_SECONDS: "300"
-      BATCH_LIMIT: "100"
-      BATCH_MODEL_VERSION: docker-catboost-v1
       POSTGRES_HOST: postgres
-      POSTGRES_DB: postgres
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
     volumes:
       - ./artifacts:/app/artifacts
     depends_on:

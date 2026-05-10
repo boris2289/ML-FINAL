@@ -1,3 +1,9 @@
+"""
+Тренировочный пайплайн CatBoost.
+
+Все гиперпараметры берутся из Settings (.env) по умолчанию,
+но могут быть перекрыты аргументами функций.
+"""
 from __future__ import annotations
 
 import json
@@ -8,8 +14,7 @@ from catboost import CatBoostRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
-from app.core.constants import CAT_FEATURES, TARGET_COL, USED_FEATURES
-from app.core.paths import ARTIFACTS_DIR, METRICS_PATH, MODEL_PATH
+from app.core.config import get_settings
 
 
 @dataclass
@@ -26,22 +31,24 @@ def train_catboost(
     x_test: pd.DataFrame,
     y_test: pd.Series,
     *,
-    iterations: int = 100,
-    depth: int = 4,
-    learning_rate: float = 0.03,
-    l2_leaf_reg: float = 7,
-    random_strength: float = 12,
-    random_state: int = 54,
+    iterations: int | None = None,
+    depth: int | None = None,
+    learning_rate: float | None = None,
+    l2_leaf_reg: float | None = None,
+    random_strength: float | None = None,
+    random_state: int | None = None,
 ) -> CatBoostRegressor:
+    cfg = get_settings()
+
     model = CatBoostRegressor(
-        iterations=iterations,
-        depth=depth,
-        learning_rate=learning_rate,
-        l2_leaf_reg=l2_leaf_reg,
-        random_strength=random_strength,
-        cat_features=CAT_FEATURES,
-        loss_function="MAE",
-        random_seed=random_state,
+        iterations=iterations or cfg.iterations,
+        depth=depth or cfg.depth,
+        learning_rate=learning_rate or cfg.learning_rate,
+        l2_leaf_reg=l2_leaf_reg or cfg.l2_leaf_reg,
+        random_strength=random_strength or cfg.random_strength,
+        cat_features=cfg.cat_features_list,
+        loss_function=cfg.loss_function,
+        random_seed=random_state or cfg.random_state,
         verbose=100,
     )
     model.fit(
@@ -69,10 +76,11 @@ def save_artifacts(
     mae: float,
     r2: float,
 ) -> TrainingResult:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = get_settings()
+    cfg.artifacts_path.mkdir(parents=True, exist_ok=True)
 
-    model.save_model(str(MODEL_PATH))
-    METRICS_PATH.write_text(
+    model.save_model(str(cfg.model_path))
+    cfg.metrics_path.write_text(
         json.dumps({"mae": mae, "r2": r2}, indent=2),
         encoding="utf-8",
     )
@@ -80,23 +88,27 @@ def save_artifacts(
     return TrainingResult(
         mae=mae,
         r2=r2,
-        model_path=str(MODEL_PATH),
-        metrics_path=str(METRICS_PATH),
+        model_path=str(cfg.model_path),
+        metrics_path=str(cfg.metrics_path),
     )
 
 
 def run_training_pipeline(
     df: pd.DataFrame,
     *,
-    test_size: float = 0.2,
-    random_state: int = 54,
+    test_size: float | None = None,
+    random_state: int | None = None,
     **model_kwargs,
 ) -> tuple[CatBoostRegressor, TrainingResult]:
-    X = df[USED_FEATURES]
-    y = df[TARGET_COL]
+    cfg = get_settings()
+
+    X = df[cfg.used_features_list]
+    y = df[cfg.target_col]
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state,
+        X, y,
+        test_size=test_size or cfg.test_size,
+        random_state=random_state or cfg.random_state,
     )
 
     model = train_catboost(X_train, y_train, X_test, y_test, **model_kwargs)

@@ -3,8 +3,7 @@ from __future__ import annotations
 import pandas as pd
 from catboost import CatBoostRegressor
 
-from app.core.constants import USED_FEATURES
-from app.core.paths import MODEL_PATH
+from app.core.config import get_settings
 
 
 class ModelNotReadyError(RuntimeError):
@@ -17,11 +16,12 @@ class PredictorService:
         self.reload()
 
     def reload(self) -> None:
-        if not MODEL_PATH.exists():
+        cfg = get_settings()
+        if not cfg.model_path.exists():
             self.model = None
             return
         self.model = CatBoostRegressor()
-        self.model.load_model(str(MODEL_PATH))
+        self.model.load_model(str(cfg.model_path))
 
     @property
     def is_ready(self) -> bool:
@@ -34,6 +34,7 @@ class PredictorService:
                 "чтобы создать artifacts/catboost_model.cbm."
             )
 
-        row = pd.DataFrame([features])[USED_FEATURES]
+        cfg = get_settings()
+        row = pd.DataFrame([features])[cfg.used_features_list]
         prediction = float(self.model.predict(row)[0])
         return {"predicted_ege_score": round(prediction, 2)}

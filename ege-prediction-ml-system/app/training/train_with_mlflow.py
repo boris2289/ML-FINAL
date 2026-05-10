@@ -1,68 +1,87 @@
+"""
+Точка входа для обучения с MLflow.
+
+Все параметры берутся из .env через Settings.
+CLI-аргументы (--iterations и т.д.) перекрывают .env,
+но если их не передать — используются значения из .env.
+"""
 from __future__ import annotations
 
 import argparse
 import json
-import os
 
 import mlflow
 import mlflow.catboost
-
-from app.training.data import load_prepared_dataset, prepare_full_dataset
-from app.training.pipeline import evaluate_model, run_training_pipeline, save_artifacts, train_catboost
-from app.core.constants import USED_FEATURES, TARGET_COL
-
 from sklearn.model_selection import train_test_split
 
-
-def str_to_bool(value: str | None) -> bool:
-    if value is None:
-        return False
-    return value.strip().lower() in {"1", "true", "yes", "y"}
+from app.core.config import get_settings
+from app.training.data import load_prepared_dataset, prepare_full_dataset
+from app.training.pipeline import evaluate_model, save_artifacts, train_catboost
 
 
 def run_training(
     *,
-    iterations: int = 3000,
-    depth: int = 12,
-    learning_rate: float = 0.03,
-    random_state: int = 54,
+    iterations: int | None = None,
+    depth: int | None = None,
+    learning_rate: float | None = None,
+    random_state: int | None = None,
     subject_filter: str | None = None,
-    experiment_name: str = "ege-prediction-experiment",
-    model_name: str = "ege-catboost-regressor",
-    register_model: bool = True,
+    experiment_name: str | None = None,
+    model_name: str | None = None,
+    register_model: bool | None = None,
     tracking_uri: str | None = None,
     skip_prepare: bool = False,
 ) -> dict:
-    if tracking_uri:
-        mlflow.set_tracking_uri(tracking_uri)
+    cfg = get_settings()
 
+    # Значения: CLI-аргумент → .env → дефолт
+    iterations = iterations or cfg.iterations
+    depth = depth or cfg.depth
+    learning_rate = learning_rate or cfg.learning_rate
+    random_state = random_state or cfg.random_state
+    experiment_name = experiment_name or cfg.experiment_name
+    model_name = model_name or cfg.model_name
+    register_model = register_model if register_model is not None else cfg.register_model
+    tracking_uri = tracking_uri or cfg.mlflow_tracking_uri
+    subject_filter = subject_filter or cfg.subject_filter_value
+
+    mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(experiment_name)
 
     # Подготовка данных
     if skip_prepare:
-        df = load_prepared_dataset()
-        if subject_filter:
-            df = df[df["subject_name"] == subject_filter]
+        df = load_prepared_dataset(experiment=experiment_name)
     else:
-        df = prepare_full_dataset(subject_filter=subject_filter)
+        df = prepare_full_dataset(
+            subject_filter=subject_filter,
+            experiment=experiment_name,
+        )
 
-    X = df[USED_FEATURES]
-    y = df[TARGET_COL]
+    X = df[cfg.used_features_list]
+    y = df[cfg.target_col]
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state,
+        X, y,
+        test_size=cfg.test_size,
+        random_state=random_state,
     )
 
-    with mlflow.start_run(run_name="catboost-ege-prediction") as run:
+    with mlflow.start_run(run_name=cfg.run_name) as run:
         mlflow.log_params({
             "model_type": "CatBoostRegressor",
             "iterations": iterations,
             "depth": depth,
             "learning_rate": learning_rate,
+            "l2_leaf_reg": cfg.l2_leaf_reg,
+            "random_strength": cfg.random_strength,
+            "loss_function": cfg.loss_function,
             "random_state": random_state,
             "subject_filter": subject_filter or "all",
             "train_rows": int(len(X_train)),
             "test_rows": int(len(X_test)),
             "n_features": int(X_train.shape[1]),
+            "test_size": cfg.test_size,
+            "rolling_window": cfg.rolling_window,
+            "experiment": experiment_name,
         })
 
         model = train_catboost(
@@ -70,6 +89,8 @@ def run_training(
             iterations=iterations,
             depth=depth,
             learning_rate=learning_rate,
+            l2_leaf_reg=cfg.l2_leaf_reg,
+            random_strength=cfg.random_strength,
             random_state=random_state,
         )
         mae, r2 = evaluate_model(model, X_test, y_test)
@@ -113,34 +134,29 @@ def run_training(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train EGE prediction model and log to MLflow.")
-    parser.add_argument("--iterations", type=int, default=int(os.getenv("ITERATIONS", "3000")))
-    parser.add_argument("--depth", type=int, default=int(os.getenv("DEPTH", "12")))
-    parser.add_argument("--learning-rate", type=float, default=float(os.getenv("LEARNING_RATE", "0.03")))
-    parser.add_argument("--random-state", type=int, default=int(os.getenv("RANDOM_STATE", "54")))
-    parser.add_argument("--subject-filter", default=os.getenv("SUBJECT_FILTER"))
-    parser.add_argument(
-        "--experiment-name",
-        default=os.getenv("MLFLOW_EXPERIMENT_NAME", "ege-prediction-experiment"),
+    cfg = get_settings()
+    parser = argparse.ArgumentParser(
+        description="Train EGE prediction model and log to MLflow. "
+                    "All defaults come from .env.",
     )
-    parser.add_argument(
-        "--model-name",
-        default=os.getenv("MODEL_NAME", "ege-catboost-regressor"),
-    )
-    parser.add_argument(
-        "--tracking-uri",
-        default=os.getenv("MLFLOW_TRACKING_URI"),
-    )
+    parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--depth", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--random-state", type=int, default=None)
+    parser.add_argument("--subject-filter", default=None)
+    parser.add_argument("--experiment-name", default=None)
+    parser.add_argument("--model-name", default=None)
+    parser.add_argument("--tracking-uri", default=None)
     parser.add_argument(
         "--register-model",
         action="store_true",
-        default=str_to_bool(os.getenv("REGISTER_MODEL", "true")),
+        default=None,
     )
     parser.add_argument(
         "--skip-prepare",
         action="store_true",
-        default=str_to_bool(os.getenv("SKIP_PREPARE", "false")),
-        help="Skip data preparation, use existing prepared_rolling_dataset.csv.",
+        default=False,
+        help="Skip data preparation, read from prepared_data table in DB.",
     )
     return parser
 

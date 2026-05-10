@@ -1,3 +1,11 @@
+"""
+Пайплайн подготовки данных.
+
+Поток: CSV-файл → raw_data (БД) → clean → cleaned_data (БД)
+       → aggregate → prepared_data (БД) → обучение.
+
+Все параметры читаются из центрального Settings (.env).
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,19 +13,26 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from app.core.paths import CLEANED_CSV_PATH, DATA_DIR, RAW_CSV_PATH, ROLLING_CSV_PATH
+from app.core.config import get_settings
+from app.db.repository import (
+    load_prepared_data,
+    load_raw_data,
+    save_cleaned_data,
+    save_prepared_data,
+    save_raw_data,
+)
 
 
-def ensure_data_dir() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
+# ──────────────────────────────────────────────
+# Загрузка сырого CSV (первый шаг)
+# ──────────────────────────────────────────────
 def load_raw_csv(path: Path | None = None) -> pd.DataFrame:
-    path = path or RAW_CSV_PATH
+    cfg = get_settings()
+    path = path or cfg.raw_csv_path
     if not path.exists():
         raise FileNotFoundError(
             f"Исходный CSV не найден: {path}. "
-            "Положите файл 2025_07_24_el_school.csv в папку data/."
+            f"Положите файл {cfg.raw_csv_filename} в папку {cfg.data_dir}/."
         )
     return pd.read_csv(path, low_memory=False)
 
@@ -26,6 +41,8 @@ def load_raw_csv(path: Path | None = None) -> pd.DataFrame:
 # Этап 1: очистка и предобработка
 # ──────────────────────────────────────────────
 def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    cfg = get_settings()
+
     keep_cols = [
         "student_id", "student_target", "student_class",
         "course_type", "course_package_type", "subject_name",
@@ -35,30 +52,31 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "student_city", "course_name",
         "homework_done_mark_probe", "clan_name",
     ]
-    df = df[keep_cols].copy()
+    df = df[[c for c in keep_cols if c in df.columns]].copy()
 
-    # Таргет: балл ЕГЭ от 30 до 100
-    df = df[df["course_student_ege_result"].between(0, 100)]
-    df = df[df["course_student_ege_result"] >= 30]
+    # Таргет: балл ЕГЭ в допустимом диапазоне
+    df = df[df["course_student_ege_result"].between(0, cfg.ege_max_score)]
+    df = df[df["course_student_ege_result"] >= cfg.ege_min_score]
     df["course_student_ege_result"] = df["course_student_ege_result"].astype(float)
 
     # Ожидаемый балл студента 0–100
     df = df[(df["student_target"] >= 0.0) & (df["student_target"] <= 100.0)]
     df["student_target"] = df["student_target"].astype(str)
 
-    # Класс: 9, 10, 11
+    # Класс: из конфига
     df["student_class"] = df["student_class"].fillna(0).astype(int)
-    df = df[df["student_class"].isin((9, 10, 11))]
+    df = df[df["student_class"].isin(cfg.allowed_classes_list)]
     df["student_class"] = df["student_class"].astype(str)
 
     # Сплит частей теста
-    df["test_part_one"] = df.apply(
-        lambda r: r["test_done_mark"] if r["test_part"] == 1.0 else None, axis=1,
-    )
-    df["test_part_two"] = df.apply(
-        lambda r: r["test_done_mark"] if r["test_part"] == 2.0 else None, axis=1,
-    )
-    df = df.drop(["test_part", "test_done_mark"], axis=1)
+    if "test_part" in df.columns and "test_done_mark" in df.columns:
+        df["test_part_one"] = df.apply(
+            lambda r: r["test_done_mark"] if r["test_part"] == 1.0 else None, axis=1,
+        )
+        df["test_part_two"] = df.apply(
+            lambda r: r["test_done_mark"] if r["test_part"] == 2.0 else None, axis=1,
+        )
+        df = df.drop(["test_part", "test_done_mark"], axis=1)
 
     # Типы
     categorical_columns = [
@@ -70,9 +88,14 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "homework_done_respectful", "homework_done_mark",
         "test_part_one", "test_part_two",
     ]
-    df[categorical_columns] = df[categorical_columns].astype(str)
-    df[numerical_columns] = df[numerical_columns].astype(float)
-    df["lesson_date"] = pd.to_datetime(df["lesson_date"])
+    for col in categorical_columns:
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+    for col in numerical_columns:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+    if "lesson_date" in df.columns:
+        df["lesson_date"] = pd.to_datetime(df["lesson_date"])
 
     return df
 
@@ -81,7 +104,9 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
 # Этап 2: лаги, дельты, rolling, экстремумы
 # ──────────────────────────────────────────────
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    cfg = get_settings()
     df = df.copy()
+    window = cfg.rolling_window
 
     # Лаги
     df["homework_lag_1"] = df.groupby("student_id")["homework_done_mark"].shift(1)
@@ -96,17 +121,17 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     df["test1_diff"] = df["test_part_one"] - df["test1_lag_1"]
     df["test2_diff"] = df["test_part_two"] - df["test2_lag_1"]
 
-    # Rolling
+    # Rolling (окно из конфига)
     for col, prefix in [
         ("homework_done_mark", "homework"),
         ("test_part_one", "test1"),
         ("test_part_two", "test2"),
     ]:
-        df[f"{prefix}_rolling_mean_3"] = (
-            df.groupby("student_id")[col].transform(lambda x: x.rolling(3).mean())
+        df[f"{prefix}_rolling_mean_{window}"] = (
+            df.groupby("student_id")[col].transform(lambda x: x.rolling(window).mean())
         )
-        df[f"{prefix}_rolling_std_3"] = (
-            df.groupby("student_id")[col].transform(lambda x: x.rolling(3).std())
+        df[f"{prefix}_rolling_std_{window}"] = (
+            df.groupby("student_id")[col].transform(lambda x: x.rolling(window).std())
         )
 
     # Экстремумы
@@ -122,13 +147,15 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_by_week(df: pd.DataFrame) -> pd.DataFrame:
+    cfg = get_settings()
+    window = cfg.rolling_window
     df = df.copy()
     df.fillna(-1, inplace=True)
     df["lesson_date"] = pd.to_datetime(df["lesson_date"])
     df["month"] = df["lesson_date"].dt.to_period("W").astype(str)
 
     group_cols = ["student_id", "course_type", "course_package_type", "subject_name", "month"]
-    agg_df = df.groupby(group_cols).agg({
+    agg_dict = {
         "homework_done_mark": "mean",
         "test_part_one": "mean",
         "test_part_two": "mean",
@@ -139,10 +166,10 @@ def aggregate_by_week(df: pd.DataFrame) -> pd.DataFrame:
         "homework_diff": "last",
         "test1_diff": "last",
         "test2_diff": "last",
-        "homework_rolling_mean_3": "last",
-        "homework_rolling_std_3": "last",
-        "test1_rolling_mean_3": "last",
-        "test2_rolling_std_3": "last",
+        f"homework_rolling_mean_{window}": "last",
+        f"homework_rolling_std_{window}": "last",
+        f"test1_rolling_mean_{window}": "last",
+        f"test2_rolling_std_{window}": "last",
         "homework_max": "last",
         "homework_min": "last",
         "test1_max": "last",
@@ -153,17 +180,22 @@ def aggregate_by_week(df: pd.DataFrame) -> pd.DataFrame:
         "student_target": "first",
         "course_student_ege_result": "first",
         "course_name": "first",
-    }).reset_index()
+    }
+    # Оставляем только колонки, присутствующие в DataFrame
+    agg_dict = {k: v for k, v in agg_dict.items() if k in df.columns}
+    agg_df = df.groupby(group_cols).agg(agg_dict).reset_index()
 
     # Клиппинг значений
     for col in ["test_part_one", "test_part_two", "homework_done_mark"]:
-        agg_df.loc[~agg_df[col].between(0, 100), col] = 100
+        if col in agg_df.columns:
+            agg_df.loc[~agg_df[col].between(0, 100), col] = 100
 
     return agg_df
 
 
 def remove_outliers(col1: str, data: pd.DataFrame) -> pd.DataFrame:
-    cols = ["course_student_ege_result", col1]
+    target = get_settings().target_col
+    cols = [target, col1]
     bounds = {}
     for col in cols:
         q1 = data[col].quantile(0.25)
@@ -172,8 +204,8 @@ def remove_outliers(col1: str, data: pd.DataFrame) -> pd.DataFrame:
         bounds[col] = (q1 - 2 * iqr, q3 + 2 * iqr)
 
     condition = (
-        (data["course_student_ege_result"] >= bounds["course_student_ege_result"][0])
-        & (data["course_student_ege_result"] <= bounds["course_student_ege_result"][1])
+        (data[target] >= bounds[target][0])
+        & (data[target] <= bounds[target][1])
         & (data[col1] >= bounds[col1][0])
         & (data[col1] <= bounds[col1][1])
     )
@@ -181,43 +213,73 @@ def remove_outliers(col1: str, data: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────
-# Полный пайплайн подготовки данных
+# Полный пайплайн подготовки данных (через БД)
 # ──────────────────────────────────────────────
 def prepare_full_dataset(
     raw_path: Path | None = None,
     subject_filter: str | None = None,
+    experiment: str | None = None,
 ) -> pd.DataFrame:
-    """Загрузить, очистить, создать фичи, агрегировать и убрать выбросы."""
-    ensure_data_dir()
+    """
+    CSV → raw_data (БД) → clean → cleaned_data (БД)
+        → aggregate → prepared_data (БД).
 
-    df = load_raw_csv(raw_path)
-    df = clean_dataset(df)
-    df = add_lag_features(df)
-    agg_df = aggregate_by_week(df)
+    Возвращает подготовленный DataFrame, готовый для обучения.
+    """
+    cfg = get_settings()
+    experiment = experiment or cfg.experiment_name
+    subject_filter = subject_filter or cfg.subject_filter_value
 
-    # Удаление выбросов
+    # 1. Читаем CSV
+    raw_df = load_raw_csv(raw_path)
+
+    # 2. Сохраняем сырые данные в БД
+    print(f"[data] Сохраняю сырые данные в raw_data (experiment={experiment})...")
+    save_raw_data(raw_df, experiment=experiment)
+
+    # 3. Очистка + фичи
+    print("[data] Очистка данных...")
+    cleaned_df = clean_dataset(raw_df)
+    cleaned_df = add_lag_features(cleaned_df)
+
+    # 4. Сохраняем очищенные данные в БД
+    print(f"[data] Сохраняю очищенные данные в cleaned_data (experiment={experiment})...")
+    save_cleaned_data(cleaned_df, experiment=experiment)
+
+    # 5. Агрегация + выбросы
+    print("[data] Агрегация и удаление выбросов...")
+    agg_df = aggregate_by_week(cleaned_df)
     for col in ["homework_done_mark", "test_part_one", "test_part_two"]:
-        agg_df = remove_outliers(col, agg_df)
+        if col in agg_df.columns:
+            agg_df = remove_outliers(col, agg_df)
 
     if subject_filter:
         agg_df = agg_df[agg_df["subject_name"] == subject_filter]
 
-    # Сохраняем промежуточные файлы
-    df.to_csv(CLEANED_CSV_PATH, index=False)
-    agg_df.to_csv(ROLLING_CSV_PATH, index=False)
+    # 6. Сохраняем подготовленные данные в БД
+    print(f"[data] Сохраняю подготовленные данные в prepared_data (experiment={experiment})...")
+    save_prepared_data(agg_df, experiment=experiment)
 
+    print(f"[data] Готово: {len(agg_df)} строк в prepared_data.")
     return agg_df
 
 
-def load_prepared_dataset(path: Path | None = None) -> pd.DataFrame:
-    """Загрузить уже подготовленный датасет."""
-    path = path or ROLLING_CSV_PATH
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Подготовленный датасет не найден: {path}. "
-            "Запустите сначала этап подготовки данных."
+def load_prepared_dataset(
+    experiment: str | None = None,
+    subject_filter: str | None = None,
+) -> pd.DataFrame:
+    """Загрузить подготовленный датасет из БД."""
+    cfg = get_settings()
+    experiment = experiment or cfg.experiment_name
+    subject_filter = subject_filter or cfg.subject_filter_value
+
+    df = load_prepared_data(
+        experiment=experiment,
+        subject_filter=subject_filter,
+    )
+    if df.empty:
+        raise RuntimeError(
+            f"Подготовленные данные не найдены в БД для experiment='{experiment}'. "
+            "Запустите сначала этап подготовки данных (prepare_full_dataset)."
         )
-    df = pd.read_csv(path)
-    df["student_target"] = df["student_target"].astype(str)
-    df["student_class"] = df["student_class"].astype(int).astype(str)
     return df

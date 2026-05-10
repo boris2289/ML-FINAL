@@ -1,28 +1,28 @@
 from __future__ import annotations
 
-import os
 import time
 
 from app.batch.pipeline import run_batch_prediction
-
-
-INTERVAL_SECONDS = int(os.getenv("BATCH_INTERVAL_SECONDS", "300"))
-MODEL_VERSION = os.getenv("BATCH_MODEL_VERSION", "scheduled-catboost-v1")
-BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "100"))
+from app.core.config import get_settings
 
 
 def main() -> None:
+    cfg = get_settings()
+    interval = cfg.batch_interval_seconds
+    limit = cfg.batch_limit
+    model_version = cfg.batch_model_version
+
     print(
-        f"Starting batch scheduler with interval={INTERVAL_SECONDS}s, "
-        f"limit={BATCH_LIMIT}, model_version={MODEL_VERSION}"
+        f"Starting batch scheduler with interval={interval}s, "
+        f"limit={limit}, model_version={model_version}"
     )
     while True:
         try:
-            result = run_batch_prediction(limit=BATCH_LIMIT, model_version=MODEL_VERSION)
+            result = run_batch_prediction(limit=limit, model_version=model_version)
             print(result)
         except Exception as exc:
             print(f"Batch scheduler iteration failed: {exc}")
-        time.sleep(INTERVAL_SECONDS)
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

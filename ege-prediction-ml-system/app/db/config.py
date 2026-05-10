@@ -1,16 +1,20 @@
+"""
+Конфиг PostgreSQL — делегирует всё в центральный Settings.
+"""
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+
+from app.core.config import get_settings
 
 
 @dataclass(frozen=True)
 class PostgresSettings:
-    host: str = os.getenv("POSTGRES_HOST", "localhost")
-    port: int = int(os.getenv("POSTGRES_PORT", "5432"))
-    dbname: str = os.getenv("POSTGRES_DB", "ege_predictions")
-    user: str = os.getenv("POSTGRES_USER", "postgres")
-    password: str = os.getenv("POSTGRES_PASSWORD", "postgres")
+    host: str
+    port: int
+    dbname: str
+    user: str
+    password: str
 
     @property
     def dsn(self) -> str:
@@ -24,4 +28,15 @@ class PostgresSettings:
         return f"jdbc:postgresql://{self.host}:{self.port}/{self.dbname}"
 
 
-settings = PostgresSettings()
+def _build_settings() -> PostgresSettings:
+    cfg = get_settings()
+    return PostgresSettings(
+        host=cfg.postgres_host,
+        port=cfg.postgres_port,
+        dbname=cfg.postgres_db,
+        user=cfg.postgres_user,
+        password=cfg.postgres_password,
+    )
+
+
+settings = _build_settings()

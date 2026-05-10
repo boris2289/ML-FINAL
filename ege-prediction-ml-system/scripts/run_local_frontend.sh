@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export API_BASE_URL="${API_BASE_URL:-http://localhost:8000}"
-streamlit run app/frontend/streamlit_app.py
+# Все параметры из .env
+streamlit run app/frontend/streamlit_app.py --server.port "${STREAMLIT_PORT:-8501}"

@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.api.services import PredictorService
-from app.core.constants import USED_FEATURES
 from app.db.repository import (
     INPUT_COLUMNS,
     fetch_input_rows_without_predictions,

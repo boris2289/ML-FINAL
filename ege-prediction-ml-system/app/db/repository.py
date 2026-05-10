@@ -1,3 +1,12 @@
+"""
+Репозиторий для работы с PostgreSQL.
+
+Таблицы:
+  raw_data      — сырой CSV
+  cleaned_data  — после очистки + лаги/rolling
+  prepared_data — агрегированный, без выбросов (для обучения)
+  students_input / predictions — инференс-пайплайн
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -7,8 +16,10 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import DictCursor, execute_values
 
-from app.db.config import PostgresSettings, settings
+from app.core.config import get_settings
+from app.db.config import PostgresSettings, settings as _default_settings
 
+# Колонки для inference-таблицы students_input (legacy)
 INPUT_COLUMNS = [
     "student_target", "student_class", "course_name", "subject_name",
     "homework_done_mark", "test_part_one", "test_part_two",
@@ -21,65 +32,193 @@ INPUT_COLUMNS = [
 ]
 
 
+# ── Подключение ──────────────────────────────────────────────
 def get_connection(db_settings: PostgresSettings | None = None):
-    db_settings = db_settings or settings
+    db_settings = db_settings or _default_settings
     return psycopg2.connect(db_settings.dsn)
 
 
 def initialize_schema(db_settings: PostgresSettings | None = None) -> None:
-    ddl = build_schema_sql()
+    """Выполняет init_tables.sql — создаёт все таблицы."""
+    sql_path = get_settings().root_dir / "sql" / "init_tables.sql"
+    ddl = sql_path.read_text(encoding="utf-8")
     with get_connection(db_settings) as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
         conn.commit()
 
 
-def build_schema_sql() -> str:
-    return """
-CREATE TABLE IF NOT EXISTS students_input (
-    id BIGSERIAL PRIMARY KEY,
-    student_target TEXT NOT NULL,
-    student_class TEXT NOT NULL,
-    course_name TEXT NOT NULL,
-    subject_name TEXT NOT NULL,
-    homework_done_mark DOUBLE PRECISION NOT NULL DEFAULT 0,
-    test_part_one DOUBLE PRECISION NOT NULL DEFAULT 0,
-    test_part_two DOUBLE PRECISION NOT NULL DEFAULT 0,
-    homework_lag_1 DOUBLE PRECISION DEFAULT -1,
-    homework_lag_2 DOUBLE PRECISION DEFAULT -1,
-    test1_lag_1 DOUBLE PRECISION DEFAULT -1,
-    test2_lag_1 DOUBLE PRECISION DEFAULT -1,
-    homework_diff DOUBLE PRECISION DEFAULT 0,
-    test1_diff DOUBLE PRECISION DEFAULT 0,
-    test2_diff DOUBLE PRECISION DEFAULT 0,
-    homework_rolling_mean_3 DOUBLE PRECISION DEFAULT -1,
-    homework_rolling_std_3 DOUBLE PRECISION DEFAULT -1,
-    test1_rolling_mean_3 DOUBLE PRECISION DEFAULT -1,
-    test2_rolling_std_3 DOUBLE PRECISION DEFAULT -1,
-    homework_max DOUBLE PRECISION DEFAULT 0,
-    homework_min DOUBLE PRECISION DEFAULT 0,
-    test1_max DOUBLE PRECISION DEFAULT 0,
-    test1_min DOUBLE PRECISION DEFAULT 0,
-    test2_max DOUBLE PRECISION DEFAULT 0,
-    test2_min DOUBLE PRECISION DEFAULT 0,
-    source_ege_result DOUBLE PRECISION,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
+# ══════════════════════════════════════════════════════════════
+#  Универсальный DataFrame ↔ таблица
+# ══════════════════════════════════════════════════════════════
+def _dataframe_to_table(
+    df: pd.DataFrame,
+    table: str,
+    *,
+    extra_cols: dict[str, Any] | None = None,
+    clear_filter: str | None = None,
+    db_settings: PostgresSettings | None = None,
+) -> int:
+    """Записать DataFrame в таблицу."""
+    if df.empty:
+        return 0
 
-CREATE TABLE IF NOT EXISTS predictions (
-    id BIGSERIAL PRIMARY KEY,
-    input_data_id BIGINT NOT NULL REFERENCES students_input(id) ON DELETE CASCADE,
-    predicted_ege_score DOUBLE PRECISION NOT NULL,
-    prediction_timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
-    model_version TEXT,
-    UNIQUE (input_data_id)
-);
+    work = df.copy()
+    extra_cols = extra_cols or {}
+    for col_name, col_val in extra_cols.items():
+        work[col_name] = col_val
 
-CREATE INDEX IF NOT EXISTS idx_pred_input_id ON predictions(input_data_id);
-CREATE INDEX IF NOT EXISTS idx_pred_timestamp ON predictions(prediction_timestamp);
-"""
+    columns = list(work.columns)
+    rows = [tuple(row[col] for col in columns) for _, row in work.iterrows()]
+
+    with get_connection(db_settings) as conn:
+        with conn.cursor() as cur:
+            if clear_filter:
+                cur.execute(f"DELETE FROM {table} WHERE {clear_filter};")
+            col_names = ", ".join(columns)
+            query = f"INSERT INTO {table} ({col_names}) VALUES %s"
+            execute_values(cur, query, rows, page_size=1000)
+        conn.commit()
+
+    return len(rows)
 
 
+def _table_to_dataframe(
+    table: str,
+    *,
+    where: str | None = None,
+    params: tuple | None = None,
+    db_settings: PostgresSettings | None = None,
+) -> pd.DataFrame:
+    """Прочитать таблицу (или её часть) в DataFrame."""
+    query = f"SELECT * FROM {table}"
+    if where:
+        query += f" WHERE {where}"
+    with get_connection(db_settings) as conn:
+        return pd.read_sql(query, conn, params=params)
+
+
+# ══════════════════════════════════════════════════════════════
+#  RAW DATA
+# ══════════════════════════════════════════════════════════════
+def save_raw_data(
+    df: pd.DataFrame,
+    experiment: str = "default",
+    clear_existing: bool = True,
+    db_settings: PostgresSettings | None = None,
+) -> int:
+    clear_filter = f"experiment = '{experiment}'" if clear_existing else None
+    table_cols = [
+        "student_id", "student_target", "student_class",
+        "course_type", "course_package_type", "subject_name",
+        "course_student_active", "course_student_ege_result",
+        "homework_done_respectful", "homework_done_mark",
+        "test_part", "test_done_mark", "lesson_date",
+        "student_city", "course_name",
+        "homework_done_mark_probe", "clan_name",
+    ]
+    existing = [c for c in table_cols if c in df.columns]
+    return _dataframe_to_table(
+        df[existing],
+        "raw_data",
+        extra_cols={"experiment": experiment},
+        clear_filter=clear_filter,
+        db_settings=db_settings,
+    )
+
+
+def load_raw_data(
+    experiment: str = "default",
+    db_settings: PostgresSettings | None = None,
+) -> pd.DataFrame:
+    return _table_to_dataframe(
+        "raw_data",
+        where="experiment = %s",
+        params=(experiment,),
+        db_settings=db_settings,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  CLEANED DATA
+# ══════════════════════════════════════════════════════════════
+def save_cleaned_data(
+    df: pd.DataFrame,
+    experiment: str = "default",
+    clear_existing: bool = True,
+    db_settings: PostgresSettings | None = None,
+) -> int:
+    clear_filter = f"experiment = '{experiment}'" if clear_existing else None
+    drop_cols = {"id", "experiment", "created_at", "loaded_at"}
+    cols = [c for c in df.columns if c not in drop_cols]
+    return _dataframe_to_table(
+        df[cols],
+        "cleaned_data",
+        extra_cols={"experiment": experiment},
+        clear_filter=clear_filter,
+        db_settings=db_settings,
+    )
+
+
+def load_cleaned_data(
+    experiment: str = "default",
+    db_settings: PostgresSettings | None = None,
+) -> pd.DataFrame:
+    return _table_to_dataframe(
+        "cleaned_data",
+        where="experiment = %s",
+        params=(experiment,),
+        db_settings=db_settings,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  PREPARED DATA  (для обучения)
+# ══════════════════════════════════════════════════════════════
+def save_prepared_data(
+    df: pd.DataFrame,
+    experiment: str = "default",
+    clear_existing: bool = True,
+    db_settings: PostgresSettings | None = None,
+) -> int:
+    clear_filter = f"experiment = '{experiment}'" if clear_existing else None
+    drop_cols = {"id", "experiment", "created_at", "loaded_at"}
+    cols = [c for c in df.columns if c not in drop_cols]
+    return _dataframe_to_table(
+        df[cols],
+        "prepared_data",
+        extra_cols={"experiment": experiment},
+        clear_filter=clear_filter,
+        db_settings=db_settings,
+    )
+
+
+def load_prepared_data(
+    experiment: str = "default",
+    subject_filter: str | None = None,
+    db_settings: PostgresSettings | None = None,
+) -> pd.DataFrame:
+    where = "experiment = %s"
+    params: list = [experiment]
+    if subject_filter:
+        where += " AND subject_name = %s"
+        params.append(subject_filter)
+    df = _table_to_dataframe(
+        "prepared_data",
+        where=where,
+        params=tuple(params),
+        db_settings=db_settings,
+    )
+    if not df.empty:
+        df["student_target"] = df["student_target"].astype(str)
+        if "student_class" in df.columns:
+            df["student_class"] = df["student_class"].astype(str)
+    return df
+
+
+# ══════════════════════════════════════════════════════════════
+#  STUDENTS INPUT / PREDICTIONS  (inference pipeline)
+# ══════════════════════════════════════════════════════════════
 def seed_input_data_from_dataframe(
     df: pd.DataFrame,
     limit: int | None = None,
@@ -106,7 +245,6 @@ def seed_input_data_from_dataframe(
                 cur.execute("TRUNCATE TABLE predictions RESTART IDENTITY CASCADE;")
                 cur.execute("TRUNCATE TABLE students_input RESTART IDENTITY CASCADE;")
 
-            placeholders = ", ".join(["%s"] * len(columns))
             col_names = ", ".join(columns)
             query = f"INSERT INTO students_input ({col_names}) VALUES %s"
             execute_values(cur, query, rows, page_size=500)
@@ -174,11 +312,11 @@ def insert_predictions(
 def get_table_counts(db_settings: PostgresSettings | None = None) -> dict[str, int]:
     with get_connection(db_settings) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM students_input;")
-            input_count = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM predictions;")
-            prediction_count = cur.fetchone()[0]
-    return {"students_input": input_count, "predictions": prediction_count}
+            counts = {}
+            for table in ("raw_data", "cleaned_data", "prepared_data", "students_input", "predictions"):
+                cur.execute(f"SELECT COUNT(*) FROM {table};")
+                counts[table] = cur.fetchone()[0]
+    return counts
 
 
 def fetch_recent_predictions(
